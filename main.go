@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -116,22 +115,19 @@ func decodePrefixed(buffer []byte, deltas []uint32) int {
 		return 0
 	}
 
-	// Calculate prefix size
 	prefixBytes := (len(deltas)*2 + 7) / 8
 	if len(buffer) < prefixBytes {
 		return 0
 	}
 
-	// Read data directly without storing lengths
 	pos := prefixBytes
 	for i := 0; i < len(deltas) && pos < len(buffer); i++ {
-		// Calculate length from prefix on-the-fly
 		prefixByteIdx := i / 4
 		bitOffset := (i % 4) * 2
 		lengthCode := (buffer[prefixByteIdx] >> bitOffset) & 0x03
 		length := lengthCode + 1
 
-		// Decode value based on calculated length
+		// Mirror the encoding bit shifting logic exactly
 		switch length {
 		case 1:
 			if pos+1 <= len(buffer) {
@@ -139,17 +135,15 @@ func decodePrefixed(buffer []byte, deltas []uint32) int {
 			}
 		case 2:
 			if pos+2 <= len(buffer) {
-				deltas[i] = uint32(binary.LittleEndian.Uint16(buffer[pos:]))
+				deltas[i] = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8
 			}
 		case 3:
-			if pos+4 <= len(buffer) { // We need 4 bytes for safe reading
-				// Read 4 bytes but mask to 3 bytes worth
-				value := binary.LittleEndian.Uint32(buffer[pos:])
-				deltas[i] = value & 0xFFFFFF
+			if pos+3 <= len(buffer) {
+				deltas[i] = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16
 			}
 		case 4:
 			if pos+4 <= len(buffer) {
-				deltas[i] = binary.LittleEndian.Uint32(buffer[pos:])
+				deltas[i] = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16 | uint32(buffer[pos+3])<<24
 			}
 		}
 		pos += int(length)
