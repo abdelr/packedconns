@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"sort"
 	"time"
 )
 
@@ -275,7 +276,120 @@ func appendPrefixed(element uint32, buffer []byte, elementCount int) (bool, []by
 	return needsRealloc, newBuffer
 }
 
-// Helper function to generate test data
+// ValueSelector maintains history of generated values and selects based on probability distribution
+type ValueSelector struct {
+	generatedValues []uint32
+	sortedValues    []uint32
+	rng             *rand.Rand
+}
+
+// NewValueSelector creates a new value selector with probabilistic distribution
+func NewValueSelector() *ValueSelector {
+	return &ValueSelector{
+		generatedValues: make([]uint32, 0),
+		sortedValues:    make([]uint32, 0),
+		rng:             rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+// GenerateInitialValue generates a new random value and adds it to the history
+func (vs *ValueSelector) GenerateInitialValue(maxValue uint32) uint32 {
+	// Generate values with different distributions to test various byte lengths
+	var value uint32
+	switch len(vs.generatedValues) % 4 {
+	case 0:
+		value = uint32(vs.rng.Intn(256)) // 1 byte
+	case 1:
+		value = uint32(vs.rng.Intn(65536)) // up to 2 bytes
+	case 2:
+		value = uint32(vs.rng.Intn(16777216)) // up to 3 bytes
+	case 3:
+		value = vs.rng.Uint32() % maxValue // up to 4 bytes
+	}
+
+	vs.addValue(value)
+	return value
+}
+
+// GetNextValue returns the next value based on probability distribution:
+// 95% probability: largest value generated so far
+// 4% probability: second largest value
+// 1% probability: third largest value
+func (vs *ValueSelector) GetNextValue() uint32 {
+	if len(vs.sortedValues) == 0 {
+		panic("No values generated yet - call GenerateInitialValue first")
+	}
+
+	prob := vs.rng.Float64()
+
+	switch {
+	case prob < 0.95:
+		// Return largest value (95% probability)
+		return vs.sortedValues[len(vs.sortedValues)-1]
+	case prob < 0.99:
+		// Return second largest value (4% probability)
+		if len(vs.sortedValues) >= 2 {
+			return vs.sortedValues[len(vs.sortedValues)-2]
+		}
+		// If only one value exists, return it
+		return vs.sortedValues[len(vs.sortedValues)-1]
+	default:
+		// Return third largest value (1% probability)
+		if len(vs.sortedValues) >= 3 {
+			return vs.sortedValues[len(vs.sortedValues)-3]
+		} else if len(vs.sortedValues) >= 2 {
+			return vs.sortedValues[len(vs.sortedValues)-2]
+		}
+		// If fewer than 3 values exist, return the largest
+		return vs.sortedValues[len(vs.sortedValues)-1]
+	}
+}
+
+// addValue adds a new value to both lists and maintains sorted order
+func (vs *ValueSelector) addValue(value uint32) {
+	vs.generatedValues = append(vs.generatedValues, value)
+
+	// Insert into sorted slice maintaining order
+	insertPos := sort.Search(len(vs.sortedValues), func(i int) bool {
+		return vs.sortedValues[i] >= value
+	})
+
+	// Insert at the correct position
+	vs.sortedValues = append(vs.sortedValues, 0)
+	copy(vs.sortedValues[insertPos+1:], vs.sortedValues[insertPos:])
+	vs.sortedValues[insertPos] = value
+}
+
+// Reset clears the value history
+func (vs *ValueSelector) Reset() {
+	vs.generatedValues = vs.generatedValues[:0]
+	vs.sortedValues = vs.sortedValues[:0]
+}
+
+// Helper function to generate test data with probabilistic selection
+func generateTestDeltasWithProbability(count int, maxValue uint32) []uint32 {
+	vs := NewValueSelector()
+	deltas := make([]uint32, count)
+
+	// Generate first value randomly
+	if count > 0 {
+		deltas[0] = vs.GenerateInitialValue(maxValue)
+	}
+
+	// Generate subsequent values using probability distribution
+	for i := 1; i < count; i++ {
+		// Occasionally generate a completely new value to add variety
+		if vs.rng.Float64() < 0.1 { // 10% chance to generate new value
+			deltas[i] = vs.GenerateInitialValue(maxValue)
+		} else {
+			deltas[i] = vs.GetNextValue()
+		}
+	}
+
+	return deltas
+}
+
+// Helper function to generate test data (original version for compatibility)
 func generateTestDeltas(count int, maxValue uint32) []uint32 {
 	rand.Seed(time.Now().UnixNano())
 	deltas := make([]uint32, count)
@@ -382,7 +496,7 @@ func main() {
 	fmt.Println("\nRunning benchmarks...")
 	fmt.Println("Use: go test -bench=. to run benchmarks")
 
-	// Quick performance comparison
+	// Quick performance comparison using original test data
 	deltas := generateTestDeltas(32, 1000000)
 	N := 1000000
 
@@ -424,12 +538,11 @@ func main() {
 	fmt.Printf("Encode speedup: %.2fx\n", float64(varintEncodeTime)/float64(prefixedEncodeTime))
 	fmt.Printf("Decode speedup: %.2fx\n", float64(varintDecodeTime)/float64(prefixedDecodeTime))
 
-	fmt.Println("\n=== Append Performance (Realistic Usage) ===")
+	fmt.Println("\n=== Append Performance (Realistic Usage with Probabilistic Values) ===")
 
-	// Test append performance with realistic scenarios (growing lists to max 32 elements)
+	// Test append performance with realistic scenarios using probabilistic value selection
 	appendN := 100000
 	maxElements := 32
-	testValues := generateTestDeltas(maxElements, 1000000) // Pre-generate test values
 
 	// Test different starting sizes and grow to 32 elements
 	startingSizes := []int{0, 8, 16, 24}
@@ -440,12 +553,17 @@ func main() {
 		}
 
 		elementsToAdd := maxElements - startSize
-		fmt.Printf("\nGrowing from %d to %d elements (%d appends per iteration):\n", startSize, maxElements, elementsToAdd)
+		fmt.Printf("\nGrowing from %d to %d elements (%d appends per iteration) with probabilistic values:\n",
+			startSize, maxElements, elementsToAdd)
 
-		// Prepare initial data
+		// Prepare initial data using probabilistic generation
 		var initialData []uint32
+		vs := NewValueSelector()
 		if startSize > 0 {
-			initialData = testValues[:startSize]
+			initialData = make([]uint32, startSize)
+			for i := 0; i < startSize; i++ {
+				initialData[i] = vs.GenerateInitialValue(1000000)
+			}
 		}
 
 		// Prepare initial Varint buffer
@@ -455,7 +573,7 @@ func main() {
 			varintInitSize := encodeVarint(initialData, varintInitBuffer)
 			varintInitBuffer = varintInitBuffer[:varintInitSize]
 		} else {
-			varintInitBuffer = make([]byte, 0, 256) // Start with reasonable capacity
+			varintInitBuffer = make([]byte, 0, 256)
 		}
 
 		// Prepare initial Prefixed buffer
@@ -465,7 +583,33 @@ func main() {
 			prefixedInitSize := encodePrefixed(initialData, prefixedInitBuffer)
 			prefixedInitBuffer = prefixedInitBuffer[:prefixedInitSize]
 		} else {
-			prefixedInitBuffer = make([]byte, 0, 256) // Start with reasonable capacity
+			prefixedInitBuffer = make([]byte, 0, 256)
+		}
+
+		// Pre-generate values for consistent testing
+		testIterations := make([][]uint32, appendN)
+		for i := 0; i < appendN; i++ {
+			vs.Reset()
+			// Regenerate initial values for this iteration
+			for j := 0; j < startSize; j++ {
+				vs.GenerateInitialValue(1000000)
+			}
+
+			// Generate values to append
+			testIterations[i] = make([]uint32, elementsToAdd)
+			for j := 0; j < elementsToAdd; j++ {
+				if j == 0 && startSize == 0 {
+					// First value when starting from empty
+					testIterations[i][j] = vs.GenerateInitialValue(1000000)
+				} else {
+					// Use probabilistic selection
+					if vs.rng.Float64() < 0.1 { // 10% chance for new value
+						testIterations[i][j] = vs.GenerateInitialValue(1000000)
+					} else {
+						testIterations[i][j] = vs.GetNextValue()
+					}
+				}
+			}
 		}
 
 		// Benchmark Varint append
@@ -478,9 +622,9 @@ func main() {
 			copy(currentBuffer, varintInitBuffer)
 			currentElementCount := startSize
 
-			// Add elements until we reach maxElements
+			// Add elements using pre-generated values
 			for j := 0; j < elementsToAdd; j++ {
-				valueToAdd := testValues[startSize+j]
+				valueToAdd := testIterations[i][j]
 				reallocated, newBuffer := appendVarint(valueToAdd, currentBuffer, currentElementCount)
 				if reallocated {
 					totalReallocationsVarint++
@@ -501,9 +645,9 @@ func main() {
 			copy(currentBuffer, prefixedInitBuffer)
 			currentElementCount := startSize
 
-			// Add elements until we reach maxElements
+			// Add elements using pre-generated values
 			for j := 0; j < elementsToAdd; j++ {
-				valueToAdd := testValues[startSize+j]
+				valueToAdd := testIterations[i][j]
 				reallocated, newBuffer := appendPrefixed(valueToAdd, currentBuffer, currentElementCount)
 				if reallocated {
 					totalReallocationsPrefixed++
@@ -521,6 +665,18 @@ func main() {
 
 		if prefixedAppendTime > 0 {
 			fmt.Printf("Append speedup: %.2fx\n", float64(varintAppendTime)/float64(prefixedAppendTime))
+		}
+
+		// Show some statistics about the generated values
+		if len(testIterations) > 0 && len(testIterations[0]) > 0 {
+			// Analyze first iteration's values
+			values := testIterations[0]
+			uniqueValues := make(map[uint32]int)
+			for _, v := range values {
+				uniqueValues[v]++
+			}
+			fmt.Printf("Value diversity: %d unique values out of %d total values (%.1f%% unique)\n",
+				len(uniqueValues), len(values), float64(len(uniqueValues))*100.0/float64(len(values)))
 		}
 	}
 
