@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -11,13 +12,8 @@ import (
 func encodeVarint(deltas []uint32, buffer []byte) int {
 	pos := 0
 	for _, delta := range deltas {
-		for delta >= 0x80 {
-			buffer[pos] = byte(delta) | 0x80
-			delta >>= 7
-			pos++
-		}
-		buffer[pos] = byte(delta)
-		pos++
+		n := binary.PutUvarint(buffer[pos:], uint64(delta))
+		pos += n
 	}
 	return pos
 }
@@ -27,24 +23,12 @@ func decodeVarint(buffer []byte, deltas []uint32) int {
 	deltaIdx := 0
 
 	for pos < len(buffer) && deltaIdx < len(deltas) {
-		var value uint32
-		var shift uint
-
-		for {
-			if pos >= len(buffer) {
-				break
-			}
-			b := buffer[pos]
-			pos++
-
-			value |= uint32(b&0x7F) << shift
-			if b&0x80 == 0 {
-				break
-			}
-			shift += 7
+		value, n := binary.Uvarint(buffer[pos:])
+		if n <= 0 {
+			break // Invalid varint or insufficient data
 		}
-
-		deltas[deltaIdx] = value
+		deltas[deltaIdx] = uint32(value)
+		pos += n
 		deltaIdx++
 	}
 
