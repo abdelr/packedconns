@@ -244,7 +244,7 @@ func main() {
 	}
 	prefixedDecodeTime := time.Since(start)
 
-	fmt.Printf("\nPerformance comparison (100k iterations):\n")
+	fmt.Printf("\nPerformance comparison (1M iterations):\n")
 	fmt.Printf("Varint   - Encode: %v, Decode: %v, Size: %d bytes\n", varintEncodeTime, varintDecodeTime, encodedSize)
 	fmt.Printf("Prefixed - Encode: %v, Decode: %v, Size: %d bytes\n", prefixedEncodeTime, prefixedDecodeTime, prefixedSize)
 	fmt.Printf("Encode speedup: %.2fx\n", float64(varintEncodeTime)/float64(prefixedEncodeTime))
