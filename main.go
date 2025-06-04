@@ -9,48 +9,82 @@ import (
 	"time"
 )
 
-// Traditional Varint Implementation
-func encodeVarint(deltas []uint32, buffer []byte) int {
+// Traditional Varint Implementation with uint64 interface and delta encoding
+func encodeVarintDeltas(sortedValues []uint64, buffer []byte) int {
+	if len(sortedValues) == 0 {
+		return 0
+	}
+
+	// Sort values and calculate deltas in single pass
+	slices.Sort(sortedValues)
+
 	pos := 0
-	for _, delta := range deltas {
+	var prevValue uint64 = 0
+
+	for _, value := range sortedValues {
+		delta := uint32(value - prevValue)
+
 		n := binary.PutUvarint(buffer[pos:], uint64(delta))
 		pos += n
+		prevValue = value
 	}
 	return pos
 }
 
-func decodeVarint(buffer []byte, deltas []uint32) int {
-	pos := 0
-	deltaIdx := 0
-
-	for pos < len(buffer) && deltaIdx < len(deltas) {
-		value, n := binary.Uvarint(buffer[pos:])
-		deltas[deltaIdx] = uint32(value)
-		pos += n
-		deltaIdx++
+func decodeVarintDeltas(buffer []byte, size int) []uint64 {
+	if len(buffer) == 0 {
+		return nil
 	}
 
-	return deltaIdx
-}
-
-func appendVarint(element uint32, buffer []byte, elementCount int) (bool, []byte) {
-	// Find insertion position while decoding existing elements
 	pos := 0
-	insertBytePos := 0
-	elementIndex := 0
+	deltaIdx := 0
+	values := make([]uint64, 0, size)
+	var currentValue uint64 = 0
 
-	for elementIndex < elementCount && pos < len(buffer) {
-		value, n := binary.Uvarint(buffer[pos:])
+	for pos < len(buffer) && deltaIdx < size {
+		deltaVal, n := binary.Uvarint(buffer[pos:])
 		if n <= 0 {
 			break
 		}
 
-		currentValue := uint32(value)
+		currentValue += deltaVal
+		values = append(values, currentValue)
+
+		pos += n
+		deltaIdx++
+	}
+
+	return values
+}
+
+func appendVarintDelta(element uint64, buffer []byte, elementCount int) (bool, []byte) {
+	if elementCount == 0 {
+		// Empty buffer case
+		var newBuffer [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(newBuffer[:], element)
+		result := make([]byte, n, n*2)
+		copy(result, newBuffer[:n])
+		return true, result
+	}
+
+	// Need to find insertion position by decoding
+	pos := 0
+	insertBytePos := 0
+	elementIndex := 0
+	var currentValue uint64 = 0
+	var lastDelta uint64
+
+	for elementIndex < elementCount && pos < len(buffer) {
+		deltaVal, n := binary.Uvarint(buffer[pos:])
+		if n <= 0 {
+			break
+		}
+
+		currentValue += deltaVal
+		lastDelta = deltaVal
 		if currentValue < element {
-			// This element should come before our new element
 			insertBytePos = pos + n
 		} else {
-			// Found the insertion point
 			break
 		}
 
@@ -58,58 +92,93 @@ func appendVarint(element uint32, buffer []byte, elementCount int) (bool, []byte
 		elementIndex++
 	}
 
-	// If we've gone through all elements, insert at the end
 	if elementIndex == elementCount {
 		insertBytePos = pos
 	}
 
-	// Calculate space needed for the new element
-	var newElementBuffer [binary.MaxVarintLen64]byte
-	newElementSize := binary.PutUvarint(newElementBuffer[:], uint64(element))
-
-	// Calculate total size needed
-	requiredSize := len(buffer) + newElementSize
-
-	// Check if current buffer has enough capacity
-	var newBuffer []byte
-	needsRealloc := cap(buffer) < requiredSize
-
-	if needsRealloc {
-		// Need to reallocate with extra capacity for future appends
-		newCapacity := requiredSize * 2
-		newBuffer = make([]byte, requiredSize, newCapacity)
-
-		// Copy data before insertion point
-		copy(newBuffer[:insertBytePos], buffer[:insertBytePos])
-
-		// Insert new element
-		copy(newBuffer[insertBytePos:insertBytePos+newElementSize], newElementBuffer[:newElementSize])
-
-		// Copy data after insertion point
-		copy(newBuffer[insertBytePos+newElementSize:], buffer[insertBytePos:])
+	// Calculate delta to insert
+	var insertDelta uint32
+	if elementIndex == 0 {
+		insertDelta = uint32(element)
 	} else {
-		// We have enough capacity, extend the slice
-		newBuffer = buffer[:requiredSize]
-
-		// Move data after insertion point to make room
-		copy(newBuffer[insertBytePos+newElementSize:], buffer[insertBytePos:len(buffer)])
-
-		// Insert new element
-		copy(newBuffer[insertBytePos:insertBytePos+newElementSize], newElementBuffer[:newElementSize])
+		// Need to decode previous value
+		prevValue := currentValue - lastDelta
+		insertDelta = uint32(element - prevValue)
 	}
 
-	return needsRealloc, newBuffer
+	// Encode new delta
+	var newElementBuffer [binary.MaxVarintLen64]byte
+	newElementSize := binary.PutUvarint(newElementBuffer[:], uint64(insertDelta))
+
+	// Need to adjust subsequent delta if not inserting at end
+	var adjustmentSize int
+	var adjustmentBuffer [binary.MaxVarintLen64]byte
+
+	if elementIndex < elementCount {
+		// Get the next element's current delta and adjust it
+		nextDeltaVal, nextDeltaSize := binary.Uvarint(buffer[insertBytePos:])
+		adjustedDelta := nextDeltaVal - uint64(insertDelta)
+		adjustmentSize = binary.PutUvarint(adjustmentBuffer[:], adjustedDelta)
+
+		// Total size change
+		sizeChange := newElementSize + adjustmentSize - nextDeltaSize
+		requiredSize := len(buffer) + sizeChange
+
+		needsRealloc := cap(buffer) < requiredSize
+		var newBuffer []byte
+
+		if needsRealloc {
+			newBuffer = make([]byte, requiredSize, requiredSize*2)
+			copy(newBuffer[:insertBytePos], buffer[:insertBytePos])
+		} else {
+			newBuffer = buffer[:requiredSize]
+			copy(newBuffer[insertBytePos+newElementSize+adjustmentSize:],
+				buffer[insertBytePos+nextDeltaSize:])
+		}
+
+		// Insert new element and adjusted delta
+		copy(newBuffer[insertBytePos:], newElementBuffer[:newElementSize])
+		copy(newBuffer[insertBytePos+newElementSize:], adjustmentBuffer[:adjustmentSize])
+
+		if needsRealloc {
+			copy(newBuffer[insertBytePos+newElementSize+adjustmentSize:],
+				buffer[insertBytePos+nextDeltaSize:])
+		}
+
+		return needsRealloc, newBuffer
+	} else {
+		// Inserting at end
+		requiredSize := len(buffer) + newElementSize
+		needsRealloc := cap(buffer) < requiredSize
+
+		var newBuffer []byte
+		if needsRealloc {
+			newBuffer = make([]byte, requiredSize, requiredSize*2)
+			copy(newBuffer, buffer)
+		} else {
+			newBuffer = buffer[:requiredSize]
+		}
+
+		copy(newBuffer[insertBytePos:], newElementBuffer[:newElementSize])
+		return needsRealloc, newBuffer
+	}
 }
 
-// Prefixed Length Implementation
-func encodePrefixed(deltas []uint32, buffer []byte) int {
-	if len(deltas) == 0 {
-		return 0
+// Prefixed Length Implementation with uint64 interface and delta encoding
+func encodePrefixedDeltas(sortedValues []uint64, buffer []byte) (int, uint64) {
+	if len(sortedValues) == 0 {
+		return 0, 0
 	}
 
-	count := len(deltas)
+	// Sort values and calculate deltas in single pass
+	slices.Sort(sortedValues)
+
+	count := len(sortedValues)
 	prefixBytes := (count*2 + 7) / 8
 	dataPos := prefixBytes
+	lastValue := sortedValues[len(sortedValues)-1]
+
+	var prevValue uint64 = 0
 
 	// Process in groups of 4 deltas per prefix byte
 	for groupStart := 0; groupStart < count; groupStart += 4 {
@@ -121,29 +190,25 @@ func encodePrefixed(deltas []uint32, buffer []byte) int {
 
 		// Process each delta in the group
 		for i := groupStart; i < groupEnd; i++ {
-			delta := deltas[i]
+			delta := uint32(sortedValues[i] - prevValue)
 			bitPos := (i - groupStart) * 2
 
 			// Determine length and write data
 			if delta < 256 {
-				// 1 byte: length code 0
 				buffer[dataPos] = byte(delta)
 				dataPos++
 			} else if delta < 65536 {
-				// 2 bytes: length code 1
 				prefixByte |= 1 << bitPos
 				buffer[dataPos] = byte(delta)
 				buffer[dataPos+1] = byte(delta >> 8)
 				dataPos += 2
 			} else if delta < 16777216 {
-				// 3 bytes: length code 2
 				prefixByte |= 2 << bitPos
 				buffer[dataPos] = byte(delta)
 				buffer[dataPos+1] = byte(delta >> 8)
 				buffer[dataPos+2] = byte(delta >> 16)
 				dataPos += 3
 			} else {
-				// 4 bytes: length code 3
 				prefixByte |= 3 << bitPos
 				buffer[dataPos] = byte(delta)
 				buffer[dataPos+1] = byte(delta >> 8)
@@ -151,416 +216,513 @@ func encodePrefixed(deltas []uint32, buffer []byte) int {
 				buffer[dataPos+3] = byte(delta >> 24)
 				dataPos += 4
 			}
+
+			prevValue = sortedValues[i]
 		}
 
-		// Write the prefix byte
 		buffer[groupStart/4] = prefixByte
 	}
 
-	return dataPos
+	return dataPos, lastValue
 }
 
-func decodePrefixed(buffer []byte, deltas []uint32) int {
-	if len(buffer) == 0 || len(deltas) == 0 {
-		return 0
+func decodePrefixedDeltas(buffer []byte, elementCount int) []uint64 {
+	if len(buffer) == 0 || elementCount == 0 {
+		return nil
 	}
 
-	prefixBytes := (len(deltas)*2 + 7) / 8
+	prefixBytes := (elementCount*2 + 7) / 8
 	if len(buffer) < prefixBytes {
-		return 0
+		return nil
 	}
 
+	values := make([]uint64, elementCount)
 	pos := prefixBytes
-	for i := 0; i < len(deltas) && pos < len(buffer); i++ {
+	var currentValue uint64 = 0
+
+	for i := 0; i < elementCount && pos < len(buffer); i++ {
 		prefixByteIdx := i / 4
 		bitOffset := (i % 4) * 2
 		lengthCode := (buffer[prefixByteIdx] >> bitOffset) & 0x03
 		length := lengthCode + 1
 
-		// Mirror the encoding bit shifting logic exactly
+		var delta uint32
 		switch length {
 		case 1:
 			if pos+1 <= len(buffer) {
-				deltas[i] = uint32(buffer[pos])
+				delta = uint32(buffer[pos])
 			}
 		case 2:
 			if pos+2 <= len(buffer) {
-				deltas[i] = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8
+				delta = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8
 			}
 		case 3:
 			if pos+3 <= len(buffer) {
-				deltas[i] = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16
+				delta = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16
 			}
 		case 4:
 			if pos+4 <= len(buffer) {
-				deltas[i] = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16 | uint32(buffer[pos+3])<<24
+				delta = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16 | uint32(buffer[pos+3])<<24
 			}
 		}
+
+		currentValue += uint64(delta)
+		values[i] = currentValue
 		pos += int(length)
 	}
 
-	return len(deltas)
+	return values
 }
 
-func appendPrefixed(element uint32, buffer []byte, elementCount int) (bool, []byte) {
+func appendPrefixedDelta(element uint64, buffer []byte, elementCount int, lastValue uint64) (bool, []byte, uint64) {
 	if elementCount == 0 {
-		// Empty buffer, create new one with single element
-		newBuffer := make([]byte, 0, 16) // Start with some capacity
+		// Empty buffer case
+		newBuffer := make([]byte, 0, 16)
 		tempBuffer := make([]byte, 16)
-		size := encodePrefixed([]uint32{element}, tempBuffer)
+		size, newLastValue := encodePrefixedDeltas([]uint64{element}, tempBuffer)
 		newBuffer = append(newBuffer, tempBuffer[:size]...)
-		return true, newBuffer
+		return true, newBuffer, newLastValue
 	}
 
-	// Calculate current prefix structure
-	oldPrefixBytes := (elementCount*2 + 7) / 8
-
-	// Optimization: Check if we can insert at the end using lastElement
-	insertPos := elementCount
-	insertBytePos := len(buffer) // Start at end of data
-
-	// Need to find insertion position by scanning backwards
-	// Start from the second-to-last element since we already know the last one
-	for i := elementCount - 1; i >= 0; i-- {
-		// Get length of current element from prefix
-		prefixByteIdx := i / 4
-		bitOffset := (i % 4) * 2
-		lengthCode := (buffer[prefixByteIdx] >> bitOffset) & 0x03
-		length := int(lengthCode + 1)
-
-		// Move position backwards by this element's length
-		insertBytePos -= length
-
-		var currentValue uint32
-
-		// Decode the current element value only when necessary
-		switch length {
-		case 1:
-			currentValue = uint32(buffer[insertBytePos])
-		case 2:
-			currentValue = uint32(buffer[insertBytePos]) | uint32(buffer[insertBytePos+1])<<8
-		case 3:
-			currentValue = uint32(buffer[insertBytePos]) | uint32(buffer[insertBytePos+1])<<8 | uint32(buffer[insertBytePos+2])<<16
-		case 4:
-			currentValue = uint32(buffer[insertBytePos]) | uint32(buffer[insertBytePos+1])<<8 | uint32(buffer[insertBytePos+2])<<16 | uint32(buffer[insertBytePos+3])<<24
-		}
-
-		if currentValue <= element {
-			// Found insertion point - insert after this element
-			insertPos = i + 1
-			insertBytePos += length // Move back to position after this element
-			break
-		} else {
-			// This element should come after our new element
-			insertPos = i
-			// insertBytePos is already correct (at start of current element)
-		}
+	// Quick check: if element is >= lastValue, might be able to append efficiently
+	if element >= lastValue {
+		return appendPrefixedDeltaAtEnd(element, buffer, elementCount, lastValue)
 	}
 
-	// Calculate new structure
-	newElementCount := elementCount + 1
-	newPrefixBytes := (newElementCount*2 + 7) / 8
+	// Full insertion logic needed
+	return insertPrefixedDeltaInMiddle(element, buffer, elementCount, lastValue)
+}
 
-	// Determine length needed for new element
+func appendPrefixedDeltaAtEnd(element uint64, buffer []byte, elementCount int, lastValue uint64) (bool, []byte, uint64) {
+	// Calculate delta from last value
+	delta := uint32(element - lastValue)
+
+	// Determine space needed for new element
 	var newElementLength int
-	if element < 256 {
+	if delta < 256 {
 		newElementLength = 1
-	} else if element < 65536 {
+	} else if delta < 65536 {
 		newElementLength = 2
-	} else if element < 16777216 {
+	} else if delta < 16777216 {
 		newElementLength = 3
 	} else {
 		newElementLength = 4
 	}
 
-	// Adjust insertBytePos for new prefix structure
-	oldDataStart := oldPrefixBytes
-	newDataStart := newPrefixBytes
-	insertBytePos = insertBytePos - oldDataStart + newDataStart
+	// Calculate new structure
+	newElementCount := elementCount + 1
+	oldPrefixBytes := (elementCount*2 + 7) / 8
+	newPrefixBytes := (newElementCount*2 + 7) / 8
 
 	// Calculate total size needed
-	newTotalSize := newPrefixBytes + (len(buffer) - oldPrefixBytes) + newElementLength
+	oldDataSize := len(buffer) - oldPrefixBytes
+	newTotalSize := newPrefixBytes + oldDataSize + newElementLength
 
 	// Check if we need to reallocate
 	needsRealloc := cap(buffer) < newTotalSize
-
-	var newBuffer []byte
 	prefixExpanded := newPrefixBytes != oldPrefixBytes
 
+	var newBuffer []byte
+
 	if needsRealloc {
-		// Allocate new buffer with extra capacity
 		newBuffer = make([]byte, newTotalSize, newTotalSize*2)
 
 		if prefixExpanded {
-			// Need to separate copies due to prefix expansion
-			// Copy existing prefix data (will be modified later)
+			// Copy and clear new prefix bytes
+			copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
+			for i := oldPrefixBytes; i < newPrefixBytes; i++ {
+				newBuffer[i] = 0
+			}
+			// Copy data
+			copy(newBuffer[newPrefixBytes:newPrefixBytes+oldDataSize], buffer[oldPrefixBytes:])
+		} else {
+			// Direct copy
+			copy(newBuffer[:len(buffer)], buffer)
+		}
+	} else {
+		newBuffer = buffer[:newTotalSize]
+
+		if prefixExpanded {
+			// Move data to make room for expanded prefix
+			copy(newBuffer[newPrefixBytes:], buffer[oldPrefixBytes:len(buffer)])
+			// Clear new prefix bytes
+			for i := oldPrefixBytes; i < newPrefixBytes; i++ {
+				newBuffer[i] = 0
+			}
+		}
+	}
+
+	// Insert new element data at end
+	dataInsertPos := newPrefixBytes + oldDataSize
+	switch newElementLength {
+	case 1:
+		newBuffer[dataInsertPos] = byte(delta)
+	case 2:
+		newBuffer[dataInsertPos] = byte(delta)
+		newBuffer[dataInsertPos+1] = byte(delta >> 8)
+	case 3:
+		newBuffer[dataInsertPos] = byte(delta)
+		newBuffer[dataInsertPos+1] = byte(delta >> 8)
+		newBuffer[dataInsertPos+2] = byte(delta >> 16)
+	case 4:
+		newBuffer[dataInsertPos] = byte(delta)
+		newBuffer[dataInsertPos+1] = byte(delta >> 8)
+		newBuffer[dataInsertPos+2] = byte(delta >> 16)
+		newBuffer[dataInsertPos+3] = byte(delta >> 24)
+	}
+
+	// Update prefix for new element (it's at position elementCount)
+	newElemPrefixByteIdx := elementCount / 4
+	newElemBitOffset := (elementCount % 4) * 2
+	newElemLengthCode := byte(newElementLength - 1)
+
+	if newElemPrefixByteIdx < newPrefixBytes {
+		newBuffer[newElemPrefixByteIdx] &= ^(0x03 << newElemBitOffset)
+		newBuffer[newElemPrefixByteIdx] |= newElemLengthCode << newElemBitOffset
+	}
+
+	return needsRealloc, newBuffer, element
+}
+
+func insertPrefixedDeltaInMiddle(element uint64, buffer []byte, elementCount int, lastValue uint64) (bool, []byte, uint64) {
+	if elementCount == 0 {
+		return appendPrefixedDeltaAtEnd(element, buffer, elementCount, lastValue)
+	}
+
+	oldPrefixBytes := (elementCount*2 + 7) / 8
+	newElementCount := elementCount + 1
+	newPrefixBytes := (newElementCount*2 + 7) / 8
+
+	// Find insertion position by decoding only what we need
+	pos := oldPrefixBytes
+	elementIndex := 0
+	var currentValue uint64 = 0
+	var insertBytePos int
+	var prevValue uint64
+	var nextElementIndex int = -1
+	var nextElementBytePos int
+	var nextElementLength int
+
+	// Scan to find insertion position
+	for elementIndex < elementCount && pos < len(buffer) {
+		prefixByteIdx := elementIndex / 4
+		bitOffset := (elementIndex % 4) * 2
+		lengthCode := (buffer[prefixByteIdx] >> bitOffset) & 0x03
+		length := int(lengthCode) + 1
+
+		var delta uint32
+		switch length {
+		case 1:
+			delta = uint32(buffer[pos])
+		case 2:
+			delta = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8
+		case 3:
+			delta = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16
+		case 4:
+			delta = uint32(buffer[pos]) | uint32(buffer[pos+1])<<8 | uint32(buffer[pos+2])<<16 | uint32(buffer[pos+3])<<24
+		}
+
+		currentValue += uint64(delta)
+
+		if currentValue < element {
+			insertBytePos = pos + length
+			prevValue = currentValue
+		} else if nextElementIndex == -1 {
+			// Found the element that will come after our insertion
+			nextElementIndex = elementIndex
+			nextElementBytePos = pos
+			nextElementLength = length
+			insertBytePos = pos
+			break
+		}
+
+		pos += length
+		elementIndex++
+	}
+
+	// If we reached the end, insert at the end
+	if nextElementIndex == -1 {
+		return appendPrefixedDeltaAtEnd(element, buffer, elementCount, lastValue)
+	}
+
+	// Calculate the delta for our new element
+	var newElementDelta uint32
+	if nextElementIndex == 0 {
+		newElementDelta = uint32(element)
+	} else {
+		newElementDelta = uint32(element - prevValue)
+	}
+
+	// Calculate the adjusted delta for the next element
+	adjustedNextDelta := uint32(currentValue - element)
+
+	// Determine lengths needed for new element and adjusted next element
+	var newElementLength int
+	if newElementDelta < 256 {
+		newElementLength = 1
+	} else if newElementDelta < 65536 {
+		newElementLength = 2
+	} else if newElementDelta < 16777216 {
+		newElementLength = 3
+	} else {
+		newElementLength = 4
+	}
+
+	var adjustedNextElementLength int
+	if adjustedNextDelta < 256 {
+		adjustedNextElementLength = 1
+	} else if adjustedNextDelta < 65536 {
+		adjustedNextElementLength = 2
+	} else if adjustedNextDelta < 16777216 {
+		adjustedNextElementLength = 3
+	} else {
+		adjustedNextElementLength = 4
+	}
+
+	// Calculate size changes
+	dataLengthChange := newElementLength + adjustedNextElementLength - nextElementLength
+	prefixBytesChange := newPrefixBytes - oldPrefixBytes
+	totalSizeChange := dataLengthChange + prefixBytesChange
+
+	newTotalSize := len(buffer) + totalSizeChange
+	needsRealloc := cap(buffer) < newTotalSize
+
+	var newBuffer []byte
+	if needsRealloc {
+		newBuffer = make([]byte, newTotalSize, newTotalSize*2)
+	} else {
+		newBuffer = buffer[:newTotalSize]
+	}
+
+	// Handle prefix expansion if needed
+	if prefixBytesChange > 0 {
+		if needsRealloc {
+			// Copy prefix bytes
 			copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
 			// Clear new prefix bytes
 			for i := oldPrefixBytes; i < newPrefixBytes; i++ {
 				newBuffer[i] = 0
 			}
-
 			// Copy data before insertion point
-			beforeSize := insertBytePos - newDataStart
-			if beforeSize > 0 {
-				copy(newBuffer[newDataStart:insertBytePos], buffer[oldDataStart:oldDataStart+beforeSize])
-			}
-
-			// Copy data after insertion point
-			afterSize := len(buffer) - oldDataStart - (insertBytePos - newDataStart)
-			if afterSize > 0 {
-				copy(newBuffer[insertBytePos+newElementLength:],
-					buffer[oldDataStart+(insertBytePos-newDataStart):])
-			}
+			copy(newBuffer[newPrefixBytes:newPrefixBytes+insertBytePos-oldPrefixBytes],
+				buffer[oldPrefixBytes:insertBytePos])
 		} else {
-			// No prefix expansion - can copy prefix and data in one go up to insertion point
-			beforeInsertionSize := insertBytePos
-			copy(newBuffer[:beforeInsertionSize], buffer[:beforeInsertionSize])
-
-			// Copy data after insertion point
-			afterSize := len(buffer) - beforeInsertionSize
-			if afterSize > 0 {
-				copy(newBuffer[insertBytePos+newElementLength:],
-					buffer[beforeInsertionSize:])
-			}
-		}
-
-		// Insert new element data
-		switch newElementLength {
-		case 1:
-			newBuffer[insertBytePos] = byte(element)
-		case 2:
-			newBuffer[insertBytePos] = byte(element)
-			newBuffer[insertBytePos+1] = byte(element >> 8)
-		case 3:
-			newBuffer[insertBytePos] = byte(element)
-			newBuffer[insertBytePos+1] = byte(element >> 8)
-			newBuffer[insertBytePos+2] = byte(element >> 16)
-		case 4:
-			newBuffer[insertBytePos] = byte(element)
-			newBuffer[insertBytePos+1] = byte(element >> 8)
-			newBuffer[insertBytePos+2] = byte(element >> 16)
-			newBuffer[insertBytePos+3] = byte(element >> 24)
-		}
-	} else {
-		// Use existing buffer
-		newBuffer = buffer[:newTotalSize]
-
-		if prefixExpanded {
-			// Handle prefix expansion - need to move data
-			oldDataSize := len(buffer) - oldDataStart
-			copy(newBuffer[newDataStart:newDataStart+oldDataSize], buffer[oldDataStart:])
+			// Move data to make room for expanded prefix
+			copy(newBuffer[newPrefixBytes+insertBytePos-oldPrefixBytes+newElementLength+adjustedNextElementLength:],
+				buffer[insertBytePos+nextElementLength:])
+			copy(newBuffer[newPrefixBytes:newPrefixBytes+insertBytePos-oldPrefixBytes],
+				buffer[oldPrefixBytes:insertBytePos])
 			// Clear new prefix bytes
 			for i := oldPrefixBytes; i < newPrefixBytes; i++ {
 				newBuffer[i] = 0
 			}
 		}
-
-		// Move data after insertion point to make room
-		afterSize := newDataStart + (len(buffer) - oldDataStart) - insertBytePos
-		if afterSize > 0 {
-			copy(newBuffer[insertBytePos+newElementLength:insertBytePos+newElementLength+afterSize],
-				newBuffer[insertBytePos:insertBytePos+afterSize])
-		}
-
-		// Insert new element data
-		switch newElementLength {
-		case 1:
-			newBuffer[insertBytePos] = byte(element)
-		case 2:
-			newBuffer[insertBytePos] = byte(element)
-			newBuffer[insertBytePos+1] = byte(element >> 8)
-		case 3:
-			newBuffer[insertBytePos] = byte(element)
-			newBuffer[insertBytePos+1] = byte(element >> 8)
-			newBuffer[insertBytePos+2] = byte(element >> 16)
-		case 4:
-			newBuffer[insertBytePos] = byte(element)
-			newBuffer[insertBytePos+1] = byte(element >> 8)
-			newBuffer[insertBytePos+2] = byte(element >> 16)
-			newBuffer[insertBytePos+3] = byte(element >> 24)
+	} else {
+		if needsRealloc {
+			// Copy everything before insertion point
+			copy(newBuffer[:insertBytePos], buffer[:insertBytePos])
+		} else {
+			// Move data after insertion point
+			copy(newBuffer[insertBytePos+newElementLength+adjustedNextElementLength:],
+				buffer[insertBytePos+nextElementLength:])
 		}
 	}
 
-	// Update prefix section efficiently
-	// Note: new prefix bytes are already cleared during copy if expansion occurred
+	// Copy prefix bytes if we haven't already
+	if !needsRealloc && prefixBytesChange == 0 {
+		// Data already in place, just copy the prefix
+		copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
+	} else if needsRealloc && prefixBytesChange == 0 {
+		copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
+	}
 
-	// Set prefix for the new element
-	newElemPrefixByteIdx := insertPos / 4
-	newElemBitOffset := (insertPos % 4) * 2
+	// Insert new element data
+	newElementInsertPos := newPrefixBytes + (insertBytePos - oldPrefixBytes)
+	switch newElementLength {
+	case 1:
+		newBuffer[newElementInsertPos] = byte(newElementDelta)
+	case 2:
+		newBuffer[newElementInsertPos] = byte(newElementDelta)
+		newBuffer[newElementInsertPos+1] = byte(newElementDelta >> 8)
+	case 3:
+		newBuffer[newElementInsertPos] = byte(newElementDelta)
+		newBuffer[newElementInsertPos+1] = byte(newElementDelta >> 8)
+		newBuffer[newElementInsertPos+2] = byte(newElementDelta >> 16)
+	case 4:
+		newBuffer[newElementInsertPos] = byte(newElementDelta)
+		newBuffer[newElementInsertPos+1] = byte(newElementDelta >> 8)
+		newBuffer[newElementInsertPos+2] = byte(newElementDelta >> 16)
+		newBuffer[newElementInsertPos+3] = byte(newElementDelta >> 24)
+	}
+
+	// Insert adjusted next element data
+	adjustedNextInsertPos := newElementInsertPos + newElementLength
+	switch adjustedNextElementLength {
+	case 1:
+		newBuffer[adjustedNextInsertPos] = byte(adjustedNextDelta)
+	case 2:
+		newBuffer[adjustedNextInsertPos] = byte(adjustedNextDelta)
+		newBuffer[adjustedNextInsertPos+1] = byte(adjustedNextDelta >> 8)
+	case 3:
+		newBuffer[adjustedNextInsertPos] = byte(adjustedNextDelta)
+		newBuffer[adjustedNextInsertPos+1] = byte(adjustedNextDelta >> 8)
+		newBuffer[adjustedNextInsertPos+2] = byte(adjustedNextDelta >> 16)
+	case 4:
+		newBuffer[adjustedNextInsertPos] = byte(adjustedNextDelta)
+		newBuffer[adjustedNextInsertPos+1] = byte(adjustedNextDelta >> 8)
+		newBuffer[adjustedNextInsertPos+2] = byte(adjustedNextDelta >> 16)
+		newBuffer[adjustedNextInsertPos+3] = byte(adjustedNextDelta >> 24)
+	}
+
+	// Copy remaining data after the adjusted element
+	if needsRealloc {
+		copy(newBuffer[adjustedNextInsertPos+adjustedNextElementLength:],
+			buffer[nextElementBytePos+nextElementLength:])
+	}
+
+	// Update prefix bits for new element
+	newElemPrefixByteIdx := nextElementIndex / 4
+	newElemBitOffset := (nextElementIndex % 4) * 2
 	newElemLengthCode := byte(newElementLength - 1)
 
 	if newElemPrefixByteIdx < newPrefixBytes {
-		// Clear the bits first, then set
 		newBuffer[newElemPrefixByteIdx] &= ^(0x03 << newElemBitOffset)
 		newBuffer[newElemPrefixByteIdx] |= newElemLengthCode << newElemBitOffset
 	}
 
-	// Shift prefix bits for elements after insertion point
-	for i := elementCount - 1; i >= insertPos; i-- {
-		// Get original prefix info
-		origPrefixByteIdx := i / 4
-		origBitOffset := (i % 4) * 2
-		lengthCode := (newBuffer[origPrefixByteIdx] >> origBitOffset) & 0x03
+	// Update prefix bits for adjusted next element
+	adjustedNextPrefixByteIdx := (nextElementIndex + 1) / 4
+	adjustedNextBitOffset := ((nextElementIndex + 1) % 4) * 2
+	adjustedNextLengthCode := byte(adjustedNextElementLength - 1)
 
-		// Calculate new position (shifted by 1)
-		newIdx := i + 1
-		newPrefixByteIdx := newIdx / 4
-		newBitOffset := (newIdx % 4) * 2
+	if adjustedNextPrefixByteIdx < newPrefixBytes {
+		newBuffer[adjustedNextPrefixByteIdx] &= ^(0x03 << adjustedNextBitOffset)
+		newBuffer[adjustedNextPrefixByteIdx] |= adjustedNextLengthCode << adjustedNextBitOffset
+	}
 
-		if newPrefixByteIdx < newPrefixBytes {
-			// Clear the new position bits first
+	// Shift prefix bits for all elements after the insertion point
+	for i := nextElementIndex + 2; i < newElementCount; i++ {
+		oldIdx := i - 1
+		oldPrefixByteIdx := oldIdx / 4
+		oldBitOffset := (oldIdx % 4) * 2
+
+		newPrefixByteIdx := i / 4
+		newBitOffset := (i % 4) * 2
+
+		if oldPrefixByteIdx < oldPrefixBytes && newPrefixByteIdx < newPrefixBytes {
+			lengthCode := (buffer[oldPrefixByteIdx] >> oldBitOffset) & 0x03
 			newBuffer[newPrefixByteIdx] &= ^(0x03 << newBitOffset)
-			// Set the new position
 			newBuffer[newPrefixByteIdx] |= lengthCode << newBitOffset
-		}
-
-		// Clear the old position if different from new position
-		if origPrefixByteIdx != newPrefixByteIdx || origBitOffset != newBitOffset {
-			newBuffer[origPrefixByteIdx] &= ^(0x03 << origBitOffset)
 		}
 	}
 
-	return needsRealloc, newBuffer
+	return needsRealloc, newBuffer, lastValue
 }
 
-// ValueSelector maintains history of generated values and selects based on probability distribution
+// Enhanced ValueSelector for uint64
 type ValueSelector struct {
-	generatedValues []uint32
-	sortedValues    []uint32
+	generatedValues []uint64
+	sortedValues    []uint64
 	rng             *rand.Rand
 }
 
-// NewValueSelector creates a new value selector with probabilistic distribution
 func NewValueSelector() *ValueSelector {
 	return &ValueSelector{
-		generatedValues: make([]uint32, 0),
-		sortedValues:    make([]uint32, 0),
+		generatedValues: make([]uint64, 0),
+		sortedValues:    make([]uint64, 0),
 		rng:             rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
-// GenerateInitialValue generates a new random value and adds it to the history
-func (vs *ValueSelector) GenerateInitialValue(maxValue uint32) uint32 {
-	// Generate values with different distributions to test various byte lengths
-	var value uint32
+func (vs *ValueSelector) GenerateInitialValue(maxValue uint64) uint64 {
+	var value uint64
 	switch len(vs.generatedValues) % 4 {
 	case 0:
-		value = uint32(vs.rng.Intn(256)) // 1 byte
+		value = uint64(vs.rng.Intn(256)) // Small delta
 	case 1:
-		value = uint32(vs.rng.Intn(65536)) // up to 2 bytes
+		value = uint64(vs.rng.Intn(65536)) // Medium delta
 	case 2:
-		value = uint32(vs.rng.Intn(16777216)) // up to 3 bytes
+		value = uint64(vs.rng.Intn(16777216)) // Large delta
 	case 3:
-		value = vs.rng.Uint32() % maxValue // up to 4 bytes
+		value = vs.rng.Uint64() % maxValue // Full range
 	}
 
 	vs.addValue(value)
 	return value
 }
 
-// GetNextValue returns the next value based on probability distribution:
-// 95% probability: largest value generated so far
-// 4% probability: second largest value
-// 1% probability: third largest value
-func (vs *ValueSelector) GetNextValue() uint32 {
+func (vs *ValueSelector) GetNextValue() uint64 {
 	if len(vs.sortedValues) == 0 {
-		panic("No values generated yet - call GenerateInitialValue first")
+		return vs.GenerateInitialValue(100)
 	}
 
 	prob := vs.rng.Float64()
+	var nextValue uint64
 
 	switch {
 	case prob < 0.95:
-		// Return largest value (95% probability)
-		return vs.sortedValues[len(vs.sortedValues)-1]
+		nextValue = vs.sortedValues[len(vs.sortedValues)-1] + vs.rng.Uint64()%100
+		vs.sortedValues = append(vs.sortedValues, nextValue)
 	case prob < 0.99:
-		// Return second largest value (4% probability)
 		if len(vs.sortedValues) >= 2 {
-			return vs.sortedValues[len(vs.sortedValues)-2]
+			nextValue = vs.sortedValues[len(vs.sortedValues)-2] + uint64(vs.rng.Float32()*float32(vs.sortedValues[len(vs.sortedValues)-1]-vs.sortedValues[len(vs.sortedValues)-2]))
+			temp := vs.sortedValues[len(vs.sortedValues)-1]
+			vs.sortedValues[len(vs.sortedValues)-1] = nextValue
+			vs.sortedValues = append(vs.sortedValues, temp)
 		}
-		// If only one value exists, return it
-		return vs.sortedValues[len(vs.sortedValues)-1]
+		nextValue = vs.sortedValues[len(vs.sortedValues)-1]
+		vs.sortedValues = append(vs.sortedValues, nextValue)
 	default:
-		// Return third largest value (1% probability)
 		if len(vs.sortedValues) >= 3 {
-			return vs.sortedValues[len(vs.sortedValues)-3]
-		} else if len(vs.sortedValues) >= 2 {
-			return vs.sortedValues[len(vs.sortedValues)-2]
+			nextValue = vs.sortedValues[len(vs.sortedValues)-3] + uint64(vs.rng.Float32()*float32(vs.sortedValues[len(vs.sortedValues)-2]-vs.sortedValues[len(vs.sortedValues)-3]))
+			temp := vs.sortedValues[len(vs.sortedValues)-1]
+			vs.sortedValues[len(vs.sortedValues)-2], vs.sortedValues[len(vs.sortedValues)-1] = nextValue, vs.sortedValues[len(vs.sortedValues)-2]
+			vs.sortedValues = append(vs.sortedValues, temp)
 		}
-		// If fewer than 3 values exist, return the largest
-		return vs.sortedValues[len(vs.sortedValues)-1]
+		nextValue = vs.sortedValues[len(vs.sortedValues)-1]
+		vs.sortedValues = append(vs.sortedValues, nextValue)
 	}
+	return nextValue
 }
 
-// addValue adds a new value to both lists and maintains sorted order
-func (vs *ValueSelector) addValue(value uint32) {
+func (vs *ValueSelector) addValue(value uint64) {
 	vs.generatedValues = append(vs.generatedValues, value)
 
-	// Insert into sorted slice maintaining order
 	insertPos := sort.Search(len(vs.sortedValues), func(i int) bool {
 		return vs.sortedValues[i] >= value
 	})
 
-	// Insert at the correct position
 	vs.sortedValues = append(vs.sortedValues, 0)
 	copy(vs.sortedValues[insertPos+1:], vs.sortedValues[insertPos:])
 	vs.sortedValues[insertPos] = value
 }
 
-// Reset clears the value history
 func (vs *ValueSelector) Reset() {
 	vs.generatedValues = vs.generatedValues[:0]
 	vs.sortedValues = vs.sortedValues[:0]
 }
 
-// Helper function to generate test data with probabilistic selection
-func generateTestDeltasWithProbability(count int, maxValue uint32) []uint32 {
+// Helper functions
+func generateTestValues(count int, maxValue uint64) []uint64 {
 	vs := NewValueSelector()
-	deltas := make([]uint32, count)
+	return generateTestValuesFromGenerator(count, maxValue, vs)
+}
 
-	// Generate first value randomly
+func generateTestValuesFromGenerator(count int, maxValue uint64, vs *ValueSelector) []uint64 {
+	values := make([]uint64, count)
+
 	if count > 0 {
-		deltas[0] = vs.GenerateInitialValue(maxValue)
+		values[0] = vs.GenerateInitialValue(maxValue)
 	}
 
-	// Generate subsequent values using probability distribution
 	for i := 1; i < count; i++ {
-		// Occasionally generate a completely new value to add variety
-		if vs.rng.Float64() < 0.1 { // 10% chance to generate new value
-			deltas[i] = vs.GenerateInitialValue(maxValue)
-		} else {
-			deltas[i] = vs.GetNextValue()
-		}
+		values[i] = vs.GenerateInitialValue(maxValue)
 	}
 
-	return deltas
+	return values
 }
 
-// Helper function to generate test data (original version for compatibility)
-func generateTestDeltas(count int, maxValue uint32) []uint32 {
-	rand.Seed(time.Now().UnixNano())
-	deltas := make([]uint32, count)
-
-	for i := 0; i < count; i++ {
-		// Generate values with different distributions to test various byte lengths
-		switch i % 4 {
-		case 0:
-			deltas[i] = uint32(rand.Intn(256)) // 1 byte
-		case 1:
-			deltas[i] = uint32(rand.Intn(65536)) // up to 2 bytes
-		case 2:
-			deltas[i] = uint32(rand.Intn(16777216)) // up to 3 bytes
-		case 3:
-			deltas[i] = rand.Uint32() % maxValue // up to 4 bytes
-		}
-	}
-
-	return deltas
-}
-
-// Helper function to compare slices
-func slicesEqual(a, b []uint32) bool {
+func slicesEqualUint64(a, b []uint64) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -572,262 +734,173 @@ func slicesEqual(a, b []uint32) bool {
 	return true
 }
 
-// Test function to verify correctness
-func TestCorrectness() {
-	fmt.Println("Testing correctness...")
+func TestDeltaEncoding() {
+	fmt.Println("Testing Delta Encoding with uint64...")
 
-	// Test with various delta values
-	testCases := [][]uint32{
+	testValues := [][]uint64{
 		{1, 2, 3, 4, 5},
 		{127, 128, 129, 255, 256},
 		{65535, 65536, 16777215, 16777216},
 		{0, 1, 127, 128, 255, 256, 65535, 65536},
 	}
 
-	for i, deltas := range testCases {
-		fmt.Printf("\nTest case %d: %v\n", i+1, deltas)
+	for i, values := range testValues {
+		fmt.Printf("\nTest case %d: %v\n", i+1, values)
 
-		// Test Varint
+		// Test Varint Delta
 		varintBuffer := make([]byte, 1024)
-		varintSize := encodeVarint(deltas, varintBuffer)
-		varintDecoded := make([]uint32, len(deltas))
-		decodeVarint(varintBuffer[:varintSize], varintDecoded)
+		varintSize := encodeVarintDeltas(values, varintBuffer)
+		decodedValues := decodeVarintDeltas(varintBuffer[:varintSize], len(values))
 
-		fmt.Printf("Varint - Size: %d bytes, Decoded: %v\n", varintSize, varintDecoded)
+		fmt.Printf("Varint Delta - Size: %d bytes\n", varintSize)
+		fmt.Printf("  Decoded: %v\n", decodedValues)
 
-		// Test Prefixed
+		// Test Prefixed Delta
 		prefixedBuffer := make([]byte, 1024)
-		prefixedSize := encodePrefixed(deltas, prefixedBuffer)
-		prefixedDecoded := make([]uint32, len(deltas))
-		decodePrefixed(prefixedBuffer[:prefixedSize], prefixedDecoded)
+		prefixedSize, prefixedLastValue := encodePrefixedDeltas(values, prefixedBuffer)
+		decodedValues2 := decodePrefixedDeltas(prefixedBuffer[:prefixedSize], len(values))
 
-		fmt.Printf("Prefixed - Size: %d bytes, Decoded: %v\n", prefixedSize, prefixedDecoded)
+		fmt.Printf("Prefixed Delta - Size: %d bytes, Last: %d\n", prefixedSize, prefixedLastValue)
+		fmt.Printf("  Decoded: %v\n", decodedValues2)
 
 		// Verify correctness
-		varintCorrect := slicesEqual(varintDecoded, deltas)
-		prefixedCorrect := slicesEqual(prefixedDecoded, deltas)
+		originalSorted := make([]uint64, len(values))
+		copy(originalSorted, values)
+		slices.Sort(originalSorted)
+
+		varintCorrect := slicesEqualUint64(decodedValues, originalSorted)
+		prefixedCorrect := slicesEqualUint64(decodedValues2, originalSorted)
 
 		fmt.Printf("Varint correct: %v, Prefixed correct: %v\n", varintCorrect, prefixedCorrect)
-	}
-
-	// Test append functions
-	fmt.Println("\n--- Testing Append Functions ---")
-
-	// Test appending to empty buffers
-	fmt.Println("\nTesting append to empty buffers:")
-	testValues := []uint32{42, 300, 70000, 20000000}
-
-	for _, val := range testValues {
-		fmt.Printf("Appending %d to empty buffer:\n", val)
-
-		// Test Varint append
-		varintBuffer := make([]byte, 0, 16)
-		reallocated, newVarintBuffer := appendVarint(val, varintBuffer, 0)
-		decoded := make([]uint32, 1)
-		decodeVarint(newVarintBuffer, decoded)
-		fmt.Printf("  Varint - Reallocated: %v, Size: %d, Decoded: %v, Correct: %v\n",
-			reallocated, len(newVarintBuffer), decoded[0], decoded[0] == val)
-
-		// Test Prefixed append
-		prefixedBuffer := make([]byte, 0, 16)
-		reallocated, newPrefixedBuffer := appendPrefixed(val, prefixedBuffer, 0)
-		decoded = make([]uint32, 1)
-		decodePrefixed(newPrefixedBuffer, decoded)
-		fmt.Printf("  Prefixed - Reallocated: %v, Size: %d, Decoded: %v, Correct: %v\n",
-			reallocated, len(newPrefixedBuffer), decoded[0], decoded[0] == val)
 	}
 }
 
 func main() {
-	TestCorrectness()
+	TestDeltaEncoding()
 
-	fmt.Println("\nRunning benchmarks...")
-	fmt.Println("Use: go test -bench=. to run benchmarks")
+	fmt.Println("\n=== Performance Testing ===")
 
-	// Quick performance comparison using original test data
-	deltas := generateTestDeltas(32, 1000000)
-	N := 1000000
+	// Generate test data
+	testValues := generateTestValues(32, 1_000_000)
+	N := 1_000_000
 
-	// Varint timing
+	// Test encoding performance
+	fmt.Printf("\nEncoding performance (%d iterations):\n", N)
+
+	// Varint encoding
 	varintBuffer := make([]byte, 1024)
+	varintSize := 0
 	start := time.Now()
 	for i := 0; i < N; i++ {
-		encodeVarint(deltas, varintBuffer)
+		varintSize += encodeVarintDeltas(testValues, varintBuffer)
 	}
-	varintEncodeTime := time.Since(start)
+	varintTime := time.Since(start)
 
-	encodedSize := encodeVarint(deltas, varintBuffer)
-	varintDecoded := make([]uint32, 32)
+	deltas := make([]uint32, len(testValues))
 	start = time.Now()
 	for i := 0; i < N; i++ {
-		decodeVarint(varintBuffer[:encodedSize], varintDecoded)
+		decodeVarintDeltas(varintBuffer, len(testValues))
 	}
 	varintDecodeTime := time.Since(start)
 
-	// Prefixed timing
+	// Prefixed encoding
 	prefixedBuffer := make([]byte, 1024)
+	prefixedSize := 0
 	start = time.Now()
 	for i := 0; i < N; i++ {
-		encodePrefixed(deltas, prefixedBuffer)
+		s, _ := encodePrefixedDeltas(testValues, prefixedBuffer)
+		prefixedSize += s
 	}
-	prefixedEncodeTime := time.Since(start)
+	prefixedTime := time.Since(start)
 
-	prefixedSize := encodePrefixed(deltas, prefixedBuffer)
-	prefixedDecoded := make([]uint32, 32)
 	start = time.Now()
 	for i := 0; i < N; i++ {
-		decodePrefixed(prefixedBuffer[:prefixedSize], prefixedDecoded)
+		decodePrefixedDeltas(prefixedBuffer, len(deltas))
 	}
 	prefixedDecodeTime := time.Since(start)
 
-	fmt.Printf("\nPerformance comparison (1M iterations):\n")
-	fmt.Printf("Varint   - Encode: %v, Decode: %v, Size: %d bytes\n", varintEncodeTime, varintDecodeTime, encodedSize)
-	fmt.Printf("Prefixed - Encode: %v, Decode: %v, Size: %d bytes\n", prefixedEncodeTime, prefixedDecodeTime, prefixedSize)
-	fmt.Printf("Encode speedup: %.2fx\n", float64(varintEncodeTime)/float64(prefixedEncodeTime))
-	fmt.Printf("Decode speedup: %.2fx\n", float64(varintDecodeTime)/float64(prefixedDecodeTime))
+	fmt.Printf("Varint Delta:   %v\n", varintTime)
+	fmt.Printf("Varint Decode:   %v\n", varintDecodeTime)
+	fmt.Printf("Prefixed Delta: %v\n", prefixedTime)
+	fmt.Printf("Prefixed Decode: %v\n", prefixedDecodeTime)
+	fmt.Printf("Compresion rate: %.2fx\n", float64(varintSize)/float64(prefixedSize))
+	fmt.Printf("Speedup encode: %.2fx\n", float64(varintTime)/float64(prefixedTime))
+	fmt.Printf("Speedup decode: %.2fx\n", float64(varintDecodeTime)/float64(prefixedDecodeTime))
 
-	fmt.Println("\n=== Append Performance (Realistic Usage with Probabilistic Values) ===")
+	// Test append performance
+	fmt.Printf("\nAppend performance testing:\n")
 
-	// Test append performance with realistic scenarios using probabilistic value selection
-	appendN := 100000
+	appendN := 10000
 	maxElements := 32
+	initialBufferSize := 1024
 
-	// Test different starting sizes and grow to 32 elements
-	startingSizes := []int{0, 8, 16, 24}
-
-	for _, startSize := range startingSizes {
+	for _, startSize := range []int{0, 8, 16, 24} {
 		if startSize >= maxElements {
 			continue
 		}
 
+		fmt.Printf("\nGrowing from %d to %d elements:\n", startSize, maxElements)
+
 		elementsToAdd := maxElements - startSize
-		fmt.Printf("\nGrowing from %d to %d elements (%d appends per iteration) with probabilistic values:\n",
-			startSize, maxElements, elementsToAdd)
-
-		// Prepare initial data using probabilistic generation
-		var initialData []uint32
-		vs := NewValueSelector()
-		if startSize > 0 {
-			initialData = make([]uint32, startSize)
-			for i := 0; i < startSize; i++ {
-				initialData[i] = vs.GenerateInitialValue(1000000)
-			}
-		}
-		slices.Sort(initialData)
-
-		// Prepare initial Varint buffer
-		var varintInitBuffer []byte
-		if startSize > 0 {
-			varintInitBuffer = make([]byte, 1024)
-			varintInitSize := encodeVarint(initialData, varintInitBuffer)
-			varintInitBuffer = varintInitBuffer[:varintInitSize]
-		} else {
-			varintInitBuffer = make([]byte, 0, 256)
-		}
-
-		// Prepare initial Prefixed buffer
-		var prefixedInitBuffer []byte
-		if startSize > 0 {
-			prefixedInitBuffer = make([]byte, 1024)
-			prefixedInitSize := encodePrefixed(initialData, prefixedInitBuffer)
-			prefixedInitBuffer = prefixedInitBuffer[:prefixedInitSize]
-		} else {
-			prefixedInitBuffer = make([]byte, 0, 256)
-		}
-
-		// Pre-generate values for consistent testing
-		testIterations := make([][]uint32, appendN)
+		varintEllapsed := time.Duration(0)
+		totalReallocationsVarint := 0
+		prefixedEllapsed := time.Duration(0)
+		totalReallocationsPrefixed := 0
 		for i := 0; i < appendN; i++ {
-			vs.Reset()
-			// Regenerate initial values for this iteration
-			for j := 0; j < startSize; j++ {
-				vs.GenerateInitialValue(1000000)
+			// Generate initial data
+			vs := NewValueSelector()
+			initialValues := generateTestValuesFromGenerator(startSize, 1_000_000, vs)
+
+			// Prepare initial buffers
+			var varintInitBuffer []byte
+			if startSize > 0 {
+				varintInitBuffer = make([]byte, initialBufferSize)
+				size := encodeVarintDeltas(initialValues, varintInitBuffer)
+				varintInitBuffer = varintInitBuffer[:size]
+			} else {
+				varintInitBuffer = make([]byte, 0, initialBufferSize)
 			}
 
 			// Generate values to append
-			testIterations[i] = make([]uint32, elementsToAdd)
-			for j := 0; j < elementsToAdd; j++ {
-				if j == 0 && startSize == 0 {
-					// First value when starting from empty
-					testIterations[i][j] = vs.GenerateInitialValue(1000000)
-				} else {
-					// Use probabilistic selection
-					if vs.rng.Float64() < 0.1 { // 10% chance for new value
-						testIterations[i][j] = vs.GenerateInitialValue(1000000)
-					} else {
-						testIterations[i][j] = vs.GetNextValue()
-					}
-				}
+			var prefixedInitBuffer []byte
+			var prefixedLastValue uint64
+			if startSize > 0 {
+				prefixedInitBuffer = make([]byte, initialBufferSize)
+				size, lastVal := encodePrefixedDeltas(initialValues, prefixedInitBuffer)
+				prefixedInitBuffer = prefixedInitBuffer[:size]
+				prefixedLastValue = lastVal
+			} else {
+				prefixedInitBuffer = make([]byte, 0, initialBufferSize)
 			}
-		}
 
-		// Benchmark Varint append
-		totalReallocationsVarint := 0
-		start = time.Now()
-
-		for i := 0; i < appendN; i++ {
-			// Reset to initial buffer state for each iteration
-			currentBuffer := make([]byte, len(varintInitBuffer), cap(varintInitBuffer))
-			copy(currentBuffer, varintInitBuffer)
-			currentElementCount := startSize
-
-			// Add elements using pre-generated values
+			// Generate values to append
 			for j := 0; j < elementsToAdd; j++ {
-				valueToAdd := testIterations[i][j]
-				reallocated, newBuffer := appendVarint(valueToAdd, currentBuffer, currentElementCount)
+				nextElement := vs.GetNextValue()
+				var reallocated bool
+
+				// Benchmark Varint append
+				start = time.Now()
+				reallocated, varintInitBuffer = appendVarintDelta(nextElement, varintInitBuffer, startSize+j)
+				varintEllapsed += time.Since(start)
 				if reallocated {
 					totalReallocationsVarint++
 				}
-				currentBuffer = newBuffer
-				currentElementCount++
-			}
-		}
-		varintAppendTime := time.Since(start)
 
-		// Benchmark Prefixed append
-		totalReallocationsPrefixed := 0
-		start = time.Now()
-
-		for i := 0; i < appendN; i++ {
-			// Reset to initial buffer state for each iteration
-			currentBuffer := make([]byte, len(prefixedInitBuffer), cap(prefixedInitBuffer))
-			copy(currentBuffer, prefixedInitBuffer)
-			currentElementCount := startSize
-
-			// Add elements using pre-generated values
-			for j := 0; j < elementsToAdd; j++ {
-				valueToAdd := testIterations[i][j]
-				reallocated, newBuffer := appendPrefixed(valueToAdd, currentBuffer, currentElementCount)
+				// Benchmark Prefixed append
+				start = time.Now()
+				reallocated, prefixedInitBuffer, prefixedLastValue = appendPrefixedDelta(nextElement, prefixedInitBuffer, startSize+j, prefixedLastValue)
+				prefixedEllapsed += time.Since(start)
 				if reallocated {
 					totalReallocationsPrefixed++
 				}
-				currentBuffer = newBuffer
-				currentElementCount++
 			}
 		}
-		prefixedAppendTime := time.Since(start)
 
-		fmt.Printf("Varint Append   - Time: %v, Reallocations: %d (%.3f per iteration)\n",
-			varintAppendTime, totalReallocationsVarint, float64(totalReallocationsVarint)/float64(appendN))
-		fmt.Printf("Prefixed Append - Time: %v, Reallocations: %d (%.3f per iteration)\n",
-			prefixedAppendTime, totalReallocationsPrefixed, float64(totalReallocationsPrefixed)/float64(appendN))
+		fmt.Printf("Varint Append:   %v, Reallocations: %d\n", varintEllapsed, totalReallocationsVarint)
+		fmt.Printf("Prefixed Append: %v, Reallocations: %d\n", prefixedEllapsed, totalReallocationsPrefixed)
 
-		if prefixedAppendTime > 0 {
-			fmt.Printf("Append speedup: %.2fx\n", float64(varintAppendTime)/float64(prefixedAppendTime))
-		}
-
-		// Show some statistics about the generated values
-		if len(testIterations) > 0 && len(testIterations[0]) > 0 {
-			// Analyze first iteration's values
-			values := testIterations[0]
-			uniqueValues := make(map[uint32]int)
-			for _, v := range values {
-				uniqueValues[v]++
-			}
-			fmt.Printf("Value diversity: %d unique values out of %d total values (%.1f%% unique)\n",
-				len(uniqueValues), len(values), float64(len(uniqueValues))*100.0/float64(len(values)))
+		if prefixedEllapsed > 0 {
+			fmt.Printf("Speedup: %.2fx\n", float64(varintEllapsed)/float64(prefixedEllapsed))
 		}
 	}
-
-	fmt.Println("\nUse: go test -bench=. to run detailed benchmarks")
 }
