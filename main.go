@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"time"
 )
@@ -33,42 +34,71 @@ func decodeVarint(buffer []byte, deltas []uint32) int {
 }
 
 func appendVarint(element uint32, buffer []byte, elementCount int) (bool, []byte) {
-	// Find the end position by decoding existing elements
+	// Find insertion position while decoding existing elements
 	pos := 0
-	for i := 0; i < elementCount && pos < len(buffer); i++ {
-		_, n := binary.Uvarint(buffer[pos:])
+	insertBytePos := 0
+	elementIndex := 0
+
+	for elementIndex < elementCount && pos < len(buffer) {
+		value, n := binary.Uvarint(buffer[pos:])
 		if n <= 0 {
 			break
 		}
+
+		currentValue := uint32(value)
+		if currentValue < element {
+			// This element should come before our new element
+			insertBytePos = pos + n
+		} else {
+			// Found the insertion point
+			break
+		}
+
 		pos += n
+		elementIndex++
+	}
+
+	// If we've gone through all elements, insert at the end
+	if elementIndex == elementCount {
+		insertBytePos = pos
 	}
 
 	// Calculate space needed for the new element
 	var newElementBuffer [binary.MaxVarintLen64]byte
 	newElementSize := binary.PutUvarint(newElementBuffer[:], uint64(element))
 
+	// Calculate total size needed
+	requiredSize := len(buffer) + newElementSize
+
 	// Check if current buffer has enough capacity
-	requiredSize := pos + newElementSize
+	var newBuffer []byte
+	needsRealloc := cap(buffer) < requiredSize
 
-	if cap(buffer) >= requiredSize {
-		// We have enough capacity, extend the slice and append
-		newBuffer := buffer[:requiredSize]
-		copy(newBuffer[pos:], newElementBuffer[:newElementSize])
-		return false, newBuffer
-	} else {
-		// Need to reallocate
-		// Create new buffer with some extra capacity for future appends
+	if needsRealloc {
+		// Need to reallocate with extra capacity for future appends
 		newCapacity := requiredSize * 2
-		newBuffer := make([]byte, requiredSize, newCapacity)
+		newBuffer = make([]byte, requiredSize, newCapacity)
 
-		// Copy existing data
-		copy(newBuffer[:pos], buffer[:pos])
+		// Copy data before insertion point
+		copy(newBuffer[:insertBytePos], buffer[:insertBytePos])
 
-		// Add new element
-		copy(newBuffer[pos:], newElementBuffer[:newElementSize])
+		// Insert new element
+		copy(newBuffer[insertBytePos:insertBytePos+newElementSize], newElementBuffer[:newElementSize])
 
-		return true, newBuffer
+		// Copy data after insertion point
+		copy(newBuffer[insertBytePos+newElementSize:], buffer[insertBytePos:])
+	} else {
+		// We have enough capacity, extend the slice
+		newBuffer = buffer[:requiredSize]
+
+		// Move data after insertion point to make room
+		copy(newBuffer[insertBytePos+newElementSize:], buffer[insertBytePos:len(buffer)])
+
+		// Insert new element
+		copy(newBuffer[insertBytePos:insertBytePos+newElementSize], newElementBuffer[:newElementSize])
 	}
+
+	return needsRealloc, newBuffer
 }
 
 // Prefixed Length Implementation
@@ -182,13 +212,54 @@ func appendPrefixed(element uint32, buffer []byte, elementCount int) (bool, []by
 		return true, newBuffer
 	}
 
-	// Calculate current and new prefix structure
-	newElementCount := elementCount + 1
+	// Calculate current prefix structure
 	oldPrefixBytes := (elementCount*2 + 7) / 8
-	newPrefixBytes := (newElementCount*2 + 7) / 8
 
-	// Find current data size (total buffer - prefix bytes)
-	currentDataSize := len(buffer) - oldPrefixBytes
+	// Optimization: Check if we can insert at the end using lastElement
+	insertPos := elementCount
+	insertBytePos := len(buffer) // Start at end of data
+
+	// Need to find insertion position by scanning backwards
+	// Start from the second-to-last element since we already know the last one
+	for i := elementCount - 1; i >= 0; i-- {
+		// Get length of current element from prefix
+		prefixByteIdx := i / 4
+		bitOffset := (i % 4) * 2
+		lengthCode := (buffer[prefixByteIdx] >> bitOffset) & 0x03
+		length := int(lengthCode + 1)
+
+		// Move position backwards by this element's length
+		insertBytePos -= length
+
+		var currentValue uint32
+
+		// Decode the current element value only when necessary
+		switch length {
+		case 1:
+			currentValue = uint32(buffer[insertBytePos])
+		case 2:
+			currentValue = uint32(buffer[insertBytePos]) | uint32(buffer[insertBytePos+1])<<8
+		case 3:
+			currentValue = uint32(buffer[insertBytePos]) | uint32(buffer[insertBytePos+1])<<8 | uint32(buffer[insertBytePos+2])<<16
+		case 4:
+			currentValue = uint32(buffer[insertBytePos]) | uint32(buffer[insertBytePos+1])<<8 | uint32(buffer[insertBytePos+2])<<16 | uint32(buffer[insertBytePos+3])<<24
+		}
+
+		if currentValue <= element {
+			// Found insertion point - insert after this element
+			insertPos = i + 1
+			insertBytePos += length // Move back to position after this element
+			break
+		} else {
+			// This element should come after our new element
+			insertPos = i
+			// insertBytePos is already correct (at start of current element)
+		}
+	}
+
+	// Calculate new structure
+	newElementCount := elementCount + 1
+	newPrefixBytes := (newElementCount*2 + 7) / 8
 
 	// Determine length needed for new element
 	var newElementLength int
@@ -202,75 +273,152 @@ func appendPrefixed(element uint32, buffer []byte, elementCount int) (bool, []by
 		newElementLength = 4
 	}
 
+	// Adjust insertBytePos for new prefix structure
+	oldDataStart := oldPrefixBytes
+	newDataStart := newPrefixBytes
+	insertBytePos = insertBytePos - oldDataStart + newDataStart
+
 	// Calculate total size needed
-	newTotalSize := newPrefixBytes + currentDataSize + newElementLength
+	newTotalSize := newPrefixBytes + (len(buffer) - oldPrefixBytes) + newElementLength
 
 	// Check if we need to reallocate
 	needsRealloc := cap(buffer) < newTotalSize
 
 	var newBuffer []byte
+	prefixExpanded := newPrefixBytes != oldPrefixBytes
+
 	if needsRealloc {
 		// Allocate new buffer with extra capacity
 		newBuffer = make([]byte, newTotalSize, newTotalSize*2)
+
+		if prefixExpanded {
+			// Need to separate copies due to prefix expansion
+			// Copy existing prefix data (will be modified later)
+			copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
+			// Clear new prefix bytes
+			for i := oldPrefixBytes; i < newPrefixBytes; i++ {
+				newBuffer[i] = 0
+			}
+
+			// Copy data before insertion point
+			beforeSize := insertBytePos - newDataStart
+			if beforeSize > 0 {
+				copy(newBuffer[newDataStart:insertBytePos], buffer[oldDataStart:oldDataStart+beforeSize])
+			}
+
+			// Copy data after insertion point
+			afterSize := len(buffer) - oldDataStart - (insertBytePos - newDataStart)
+			if afterSize > 0 {
+				copy(newBuffer[insertBytePos+newElementLength:],
+					buffer[oldDataStart+(insertBytePos-newDataStart):])
+			}
+		} else {
+			// No prefix expansion - can copy prefix and data in one go up to insertion point
+			beforeInsertionSize := insertBytePos
+			copy(newBuffer[:beforeInsertionSize], buffer[:beforeInsertionSize])
+
+			// Copy data after insertion point
+			afterSize := len(buffer) - beforeInsertionSize
+			if afterSize > 0 {
+				copy(newBuffer[insertBytePos+newElementLength:],
+					buffer[beforeInsertionSize:])
+			}
+		}
+
+		// Insert new element data
+		switch newElementLength {
+		case 1:
+			newBuffer[insertBytePos] = byte(element)
+		case 2:
+			newBuffer[insertBytePos] = byte(element)
+			newBuffer[insertBytePos+1] = byte(element >> 8)
+		case 3:
+			newBuffer[insertBytePos] = byte(element)
+			newBuffer[insertBytePos+1] = byte(element >> 8)
+			newBuffer[insertBytePos+2] = byte(element >> 16)
+		case 4:
+			newBuffer[insertBytePos] = byte(element)
+			newBuffer[insertBytePos+1] = byte(element >> 8)
+			newBuffer[insertBytePos+2] = byte(element >> 16)
+			newBuffer[insertBytePos+3] = byte(element >> 24)
+		}
 	} else {
 		// Use existing buffer
 		newBuffer = buffer[:newTotalSize]
-	}
 
-	// Handle data movement if prefix size changed
-	if newPrefixBytes != oldPrefixBytes {
-		// Need to move existing data to accommodate larger prefix
-		if needsRealloc {
-			// Copy prefix
-			copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
-			// Copy data to new position
-			copy(newBuffer[newPrefixBytes:newPrefixBytes+currentDataSize],
-				buffer[oldPrefixBytes:oldPrefixBytes+currentDataSize])
-		} else {
-			// Move data within same buffer (move backwards to avoid overlap)
-			copy(newBuffer[newPrefixBytes:newPrefixBytes+currentDataSize],
-				buffer[oldPrefixBytes:oldPrefixBytes+currentDataSize])
-			// Copy prefix
-			copy(newBuffer[:oldPrefixBytes], buffer[:oldPrefixBytes])
+		if prefixExpanded {
+			// Handle prefix expansion - need to move data
+			oldDataSize := len(buffer) - oldDataStart
+			copy(newBuffer[newDataStart:newDataStart+oldDataSize], buffer[oldDataStart:])
+			// Clear new prefix bytes
+			for i := oldPrefixBytes; i < newPrefixBytes; i++ {
+				newBuffer[i] = 0
+			}
 		}
-		// Clear new prefix bytes
-		for i := oldPrefixBytes; i < newPrefixBytes; i++ {
-			newBuffer[i] = 0
+
+		// Move data after insertion point to make room
+		afterSize := newDataStart + (len(buffer) - oldDataStart) - insertBytePos
+		if afterSize > 0 {
+			copy(newBuffer[insertBytePos+newElementLength:insertBytePos+newElementLength+afterSize],
+				newBuffer[insertBytePos:insertBytePos+afterSize])
 		}
-	} else if needsRealloc {
-		// Same prefix size, just copy everything
-		copy(newBuffer, buffer)
+
+		// Insert new element data
+		switch newElementLength {
+		case 1:
+			newBuffer[insertBytePos] = byte(element)
+		case 2:
+			newBuffer[insertBytePos] = byte(element)
+			newBuffer[insertBytePos+1] = byte(element >> 8)
+		case 3:
+			newBuffer[insertBytePos] = byte(element)
+			newBuffer[insertBytePos+1] = byte(element >> 8)
+			newBuffer[insertBytePos+2] = byte(element >> 16)
+		case 4:
+			newBuffer[insertBytePos] = byte(element)
+			newBuffer[insertBytePos+1] = byte(element >> 8)
+			newBuffer[insertBytePos+2] = byte(element >> 16)
+			newBuffer[insertBytePos+3] = byte(element >> 24)
+		}
 	}
 
-	// Add new element data at the end
-	dataPos := newPrefixBytes + currentDataSize
-	switch newElementLength {
-	case 1:
-		newBuffer[dataPos] = byte(element)
-	case 2:
-		newBuffer[dataPos] = byte(element)
-		newBuffer[dataPos+1] = byte(element >> 8)
-	case 3:
-		newBuffer[dataPos] = byte(element)
-		newBuffer[dataPos+1] = byte(element >> 8)
-		newBuffer[dataPos+2] = byte(element >> 16)
-	case 4:
-		newBuffer[dataPos] = byte(element)
-		newBuffer[dataPos+1] = byte(element >> 8)
-		newBuffer[dataPos+2] = byte(element >> 16)
-		newBuffer[dataPos+3] = byte(element >> 24)
+	// Update prefix section efficiently
+	// Note: new prefix bytes are already cleared during copy if expansion occurred
+
+	// Set prefix for the new element
+	newElemPrefixByteIdx := insertPos / 4
+	newElemBitOffset := (insertPos % 4) * 2
+	newElemLengthCode := byte(newElementLength - 1)
+
+	if newElemPrefixByteIdx < newPrefixBytes {
+		// Clear the bits first, then set
+		newBuffer[newElemPrefixByteIdx] &= ^(0x03 << newElemBitOffset)
+		newBuffer[newElemPrefixByteIdx] |= newElemLengthCode << newElemBitOffset
 	}
 
-	// Update prefix for new element
-	newElementIndex := elementCount // 0-based index for new element
-	prefixByteIdx := newElementIndex / 4
-	bitOffset := (newElementIndex % 4) * 2
-	lengthCode := byte(newElementLength - 1)
+	// Shift prefix bits for elements after insertion point
+	for i := elementCount - 1; i >= insertPos; i-- {
+		// Get original prefix info
+		origPrefixByteIdx := i / 4
+		origBitOffset := (i % 4) * 2
+		lengthCode := (newBuffer[origPrefixByteIdx] >> origBitOffset) & 0x03
 
-	if prefixByteIdx < newPrefixBytes {
-		// Clear the bits first, then set new length code
-		newBuffer[prefixByteIdx] &= ^(0x03 << bitOffset)
-		newBuffer[prefixByteIdx] |= lengthCode << bitOffset
+		// Calculate new position (shifted by 1)
+		newIdx := i + 1
+		newPrefixByteIdx := newIdx / 4
+		newBitOffset := (newIdx % 4) * 2
+
+		if newPrefixByteIdx < newPrefixBytes {
+			// Clear the new position bits first
+			newBuffer[newPrefixByteIdx] &= ^(0x03 << newBitOffset)
+			// Set the new position
+			newBuffer[newPrefixByteIdx] |= lengthCode << newBitOffset
+		}
+
+		// Clear the old position if different from new position
+		if origPrefixByteIdx != newPrefixByteIdx || origBitOffset != newBitOffset {
+			newBuffer[origPrefixByteIdx] &= ^(0x03 << origBitOffset)
+		}
 	}
 
 	return needsRealloc, newBuffer
@@ -565,6 +713,7 @@ func main() {
 				initialData[i] = vs.GenerateInitialValue(1000000)
 			}
 		}
+		slices.Sort(initialData)
 
 		// Prepare initial Varint buffer
 		var varintInitBuffer []byte
